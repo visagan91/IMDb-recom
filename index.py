@@ -1,52 +1,60 @@
-import argparse
-import os
+#!/usr/bin/env python3
+# build_index.py
+from pathlib import Path
+import re, json, pickle
+import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.model_selection import train_test_split
-from scipy.sparse import save_npz
-import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy import sparse
 
-DEF_CSV = "data/imdb_2024_movies.csv"
+# Point this at your CSV (yours is imdb_2024_list_all.csv)
+DATA_CSV = Path("imdb_2024_list_all.csv")
+ART_DIR = Path("artifacts")
+ART_DIR.mkdir(exist_ok=True, parents=True)
 
-def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["storyline"] = df["storyline"].fillna("").astype(str)
-    df["title"] = df["title"].fillna("").astype(str)
-    # Basic sanity filter
-    df = df[df["storyline"].str.len() > 30]
-    df = df.drop_duplicates(subset=["imdb_id"]).reset_index(drop=True)
-    return df
+TITLE_COL = "Movie Name"
+STORY_COL = "Storyline (list blurb)"   # <== your dataset’s storyline column
+
+def clean_story(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\u200b", "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default=DEF_CSV, help="Path to CSV with columns [title, storyline, url, imdb_id]")
-    parser.add_argument("--outdir", default="data", help="Where to save vectorizers and matrices")
-    parser.add_argument("--min_df", type=int, default=2, help="Min doc freq for vectorizers")
-    parser.add_argument("--max_features", type=int, default=100000, help="Max features for vectorizers")
-    args = parser.parse_args()
+    df = pd.read_csv(DATA_CSV)
+    # Keep useful columns, de-dup movies by IMDb ID if present
+    keep_cols = [c for c in [TITLE_COL, "IMDb ID", "URL", "Rating", "Duration", STORY_COL] if c in df.columns]
+    df = df[keep_cols].drop_duplicates(subset=["IMDb ID"], keep="first")
 
-    os.makedirs(args.outdir, exist_ok=True)
+    # Clean story text and drop very short/missing
+    df[STORY_COL] = df[STORY_COL].astype(str).map(clean_story)
+    df = df[df[STORY_COL].str.len() >= 20].reset_index(drop=True)
 
-    df = pd.read_csv(args.csv)
-    df = clean_df(df)
-    print(f"Loaded {len(df)} rows from {args.csv}")
+    # TF-IDF on the storyline (bigrams help a lot for plots)
+    vec = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=2,
+        max_df=0.9,
+        max_features=200_000,
+        dtype=np.float32,
+    )
+    X = vec.fit_transform(df[STORY_COL].values)
 
-    # TF-IDF
-    tfidf = TfidfVectorizer(stop_words="english", ngram_range=(1,2), min_df=args.min_df, max_features=args.max_features, strip_accents="unicode")
-    X_tfidf = tfidf.fit_transform(df["storyline"])
-    joblib.dump(tfidf, os.path.join(args.outdir, "tfidf_vectorizer.pkl"))
-    save_npz(os.path.join(args.outdir, "tfidf_matrix.npz"), X_tfidf)
-    print(f"Saved TF-IDF: {X_tfidf.shape}")
+    # Persist artifacts
+    sparse.save_npz(ART_DIR / "tfidf_2024.npz", X)
+    with open(ART_DIR / "vectorizer.pkl", "wb") as f:
+        pickle.dump(vec, f)
 
-    # Count
-    count = CountVectorizer(stop_words="english", ngram_range=(1,2), min_df=args.min_df, max_features=args.max_features, strip_accents="unicode")
-    X_count = count.fit_transform(df["storyline"])
-    joblib.dump(count, os.path.join(args.outdir, "count_vectorizer.pkl"))
-    save_npz(os.path.join(args.outdir, "count_matrix.npz"), X_count)
-    print(f"Saved Count: {X_count.shape}")
+    # Save metadata for the app
+    df.to_csv(ART_DIR / "movies_meta.csv", index=False)
+    with open(ART_DIR / "config.json", "w") as f:
+        json.dump({"title_col": TITLE_COL, "story_col": STORY_COL}, f, indent=2)
 
-    # Save the cleaned dataframe to ensure app uses same ordering
-    df.to_csv(os.path.join(args.outdir, "clean_movies.csv"), index=False)
+    print(f"✅ Indexed {len(df):,} movies | TF-IDF shape: {X.shape} | Artifacts -> {ART_DIR}/")
 
 if __name__ == "__main__":
     main()

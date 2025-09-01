@@ -1,66 +1,233 @@
-import streamlit as st
-import pandas as pd
+#!/usr/bin/env python3
+from pathlib import Path
+import json, pickle, io
 import numpy as np
-from scipy.sparse import load_npz
-import joblib
-from sklearn.metrics.pairwise import linear_kernel, cosine_similarity
+import pandas as pd
+import streamlit as st
+from scipy import sparse
 
-st.set_page_config(page_title="IMDb 2024 Storyline Recommender", page_icon="🎬", layout="wide")
-st.title("🎬 IMDb 2024 — Storyline-based Movie Recommender")
+# ---------- Page config (must be first Streamlit call; only once) ----------
+st.set_page_config(
+    page_title="IMDb 2024 Storyline Recommender",
+    page_icon="🎬",
+    layout="wide",
+)
 
+ART_DIR = Path("artifacts")
+
+# ---------- Cached loaders ----------
 @st.cache_resource
-def load_assets(kind: str = "tfidf"):
-    df = pd.read_csv("data/clean_movies.csv")
-    if kind == "tfidf":
-        vec = joblib.load("data/tfidf_vectorizer.pkl")
-        mat = load_npz("data/tfidf_matrix.npz")
+def load_artifacts():
+    with open(ART_DIR / "config.json") as f:
+        cfg = json.load(f)
+    df = pd.read_csv(ART_DIR / "movies_meta.csv")
+    X = sparse.load_npz(ART_DIR / "tfidf_2024.npz")
+    with open(ART_DIR / "vectorizer.pkl", "rb") as f:
+        vec = pickle.load(f)
+    return cfg, df, X, vec
+
+@st.cache_data
+def prep_df(df: pd.DataFrame, rating_col="Rating", duration_col="Duration"):
+    df = df.copy()
+    if rating_col in df.columns:
+        def _to_float(x):
+            try:
+                return float(str(x).strip())
+            except:
+                return np.nan
+        df["rating_float"] = df[rating_col].map(_to_float)
     else:
-        vec = joblib.load("data/count_vectorizer.pkl")
-        mat = load_npz("data/count_matrix.npz")
-    return df, vec, mat
+        df["rating_float"] = np.nan
+
+    if duration_col in df.columns:
+        df["duration_str"] = df[duration_col].astype(str)
+    else:
+        df["duration_str"] = ""
+    return df
+
+# ---------- Similarity helpers ----------
+def cosine_topk(X, q, k):
+    # TF-IDF from sklearn is L2-normalized → cosine == dot
+    sims = (X @ q.T).toarray().ravel()
+    k = min(k, len(sims)) if len(sims) else 1
+    order = np.argpartition(-sims, kth=k-1)[:k]
+    order = order[np.argsort(-sims[order])]
+    return order, sims
+
+def explain_overlap(q, x_row, vec, topn=8):
+    prod = x_row.multiply(q)  # elementwise product in sparse
+    if prod.nnz == 0:
+        return []
+    data, idxs = prod.data, prod.indices
+    if len(data) <= topn:
+        top_i = np.argsort(-data)
+    else:
+        top_i = np.argpartition(-data, kth=topn-1)[:topn]
+        top_i = top_i[np.argsort(-data[top_i])]
+    vocab = vec.get_feature_names_out()
+    return [vocab[idxs[i]] for i in top_i]
+
+# ---------- Load data once ----------
+cfg, df_raw, X, vec = load_artifacts()
+TITLE_COL = cfg["title_col"]
+STORY_COL = cfg["story_col"]
+df = prep_df(df_raw)
+
+# ---------- UI ----------
+st.title("🎬 IMDb 2024 — Storyline Recommender (Enhanced)")
 
 with st.sidebar:
-    st.header("Settings")
-    vect_kind = st.radio("Vectorizer", ["TF-IDF", "Count"], index=0)
-    top_n = st.slider("Top N", min_value=3, max_value=20, value=5, step=1)
-    min_chars = st.slider("Min input length", 20, 500, 80, 10)
+    st.header("Choose how to recommend")
+    mode = st.radio("Recommendation mode", ["Type a storyline", "More like this movie"], index=0)
+    k = st.slider("How many recommendations?", 1, 20, 5)
+    min_sim = st.slider("Similarity", 0.0, 1.0, 0.05, 0.01)
+    min_rating = st.slider("Min IMDb rating (optional)", 0.0, 10.0, 0.0, 0.1)
+    show_explain = st.checkbox("Show why it matched (top terms)", value=True)
+
     st.markdown("---")
-    st.caption("Tip: Build indices with `python build_index.py` after scraping.")
+    st.caption("TF-IDF (1–2 grams, English stopwords). Cosine similarity via dot product.")
 
-df, vectorizer, matrix = load_assets("tfidf" if vect_kind == "TF-IDF" else "count")
+# ---------- Mode: text query ----------
+def run_text_mode():
+    st.subheader("Type a storyline")
+    user_text = st.text_area(
+        "Paste a short plot or concept:",
+        height=140,
+        placeholder="Military unit in hostile territory must fight for survival..."
+    )
+    go = st.button("Recommend", type="primary", use_container_width=True)
+    if not (go and user_text.strip()):
+        return
 
-st.write("Paste a short storyline/plot. We'll compute cosine similarity against all 2024 movies and show the most similar ones.")
+    q = vec.transform([user_text])
+    order, sims = cosine_topk(X, q, k=max(k*4, 50))  # oversample; we’ll filter
 
-user_text = st.text_area("Your storyline", height=160, placeholder="e.g., A young wizard begins his journey at a magical school...")
+    res = df.iloc[order].copy()
+    res["similarity"] = sims[order]
 
-colA, colB = st.columns([1, 3])
-with colA:
-    go = st.button("Recommend")
-with colB:
-    st.caption("Cosine similarity over " + vect_kind + " features; bigrams enabled; English stopwords removed.")
+    # thresholds
+    res = res[res["similarity"] >= min_sim]
+    if min_rating > 0:
+        res = res[(res["rating_float"].isna()) | (res["rating_float"] >= min_rating)]
 
-def recommend(query: str, top_k: int = 5):
-    q_vec = vectorizer.transform([query])
-    # For TF-IDF, linear_kernel is equivalent to cosine similarity on normalized vectors
-    sims = linear_kernel(q_vec, matrix).ravel()
-    top_idx = np.argsort(-sims)[:top_k]
-    return [(int(i), float(sims[i])) for i in top_idx]
+    res = res.sort_values("similarity", ascending=False).head(k)
 
-if go:
-    if not user_text or len(user_text) < min_chars:
-        st.warning(f"Please enter at least {min_chars} characters of storyline for better results.")
-    else:
-        results = recommend(user_text, top_n)
-        st.subheader(f"Top {top_n} recommendations")
-        for rank, (idx, score) in enumerate(results, start=1):
-            row = df.iloc[idx]
-            title = row.get("title", "(unknown)")
-            url = row.get("url", "")
-            storyline = row.get("storyline", "")
-            with st.container(border=True):
-                st.markdown(f"### {rank}. [{title}]({url})  \n*Similarity:* `{score:.3f}`")
-                st.write(storyline)
+    if res.empty:
+        st.warning("No matches over the current thresholds. Try lowering ‘Min similarity’ or entering a bit more detail.")
+        return
 
-st.markdown("---")
-with st.expander("About"):
-    st.write
+    for i, (_, r) in enumerate(res.iterrows(), start=1):
+        st.markdown(f"### {i}. {r[TITLE_COL]}")
+        st.markdown(
+            f"**Similarity:** `{r['similarity']:.3f}`"
+            + (f"  ·  **Rating:** `{r['rating_float']:.1f}`" if pd.notna(r['rating_float']) else "")
+        )
+        story = r.get(STORY_COL)
+        if isinstance(story, str) and story.strip():
+            with st.expander("Storyline", expanded=True):
+                st.write(story)
+
+        url = r.get("URL")
+        if isinstance(url, str) and url.startswith("http"):
+            st.link_button("Open on IMDb", url, use_container_width=False)
+
+        if show_explain:
+            idx = r.name
+            terms = explain_overlap(q, X[idx], vec, topn=8)
+            if terms:
+                st.caption("Why it matched:")
+                st.write(" · ".join(f"`{t}`" for t in terms))
+        st.divider()
+
+    # download
+    csv_buf = io.StringIO()
+    res[[TITLE_COL, "similarity", "rating_float", STORY_COL, "URL"]].rename(
+        columns={"rating_float": "Rating"}
+    ).to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Download results (CSV)", data=csv_buf.getvalue(),
+                       file_name="recommendations.csv", mime="text/csv")
+
+# ---------- Mode: similar to a movie ----------
+def run_item_mode():
+    st.subheader("More like this movie")
+    pick = st.selectbox("Choose a reference movie", options=df[TITLE_COL].tolist())
+    go = st.button("Find similar", type="primary", use_container_width=True)
+    if not (go and pick):
+        return
+
+    base_idx = df.index[df[TITLE_COL] == pick][0]
+    q = X[base_idx]
+
+    order, sims = cosine_topk(X, q, k=max(k*10, 500))  # oversample; we will filter
+    res = df.iloc[order].copy()
+    res["similarity"] = sims[order]
+
+    if exclude_same_title:
+        res = res[df[TITLE_COL] != pick]
+
+    res = res[res["similarity"] >= min_sim]
+    if min_rating > 0:
+        res = res[(res["rating_float"].isna()) | (res["rating_float"] >= min_rating)]
+
+    res = res.sort_values("similarity", ascending=False).take(range(min(k, len(res))))
+
+    if res.empty:
+        st.warning("No similar movies over the current thresholds. Try lowering ‘Min similarity’.")
+        return
+
+    # reference movie card
+    with st.expander("Reference movie", expanded=False):
+        r0 = df.iloc[base_idx]
+        st.markdown(
+            f"**{r0[TITLE_COL]}**"
+            + (f"  ·  Rating: `{r0['rating_float']:.1f}`" if pd.notna(r0['rating_float']) else "")
+        )
+        st.write(r0.get(STORY_COL, ""))
+        url0 = r0.get("URL")
+        if isinstance(url0, str) and url0.startswith("http"):
+            st.link_button("Open on IMDb", url0)
+
+    for i, (_, r) in enumerate(res.iterrows(), start=1):
+        st.markdown(f"### {i}. {r[TITLE_COL]}")
+        st.markdown(
+            f"**Similarity:** `{r['similarity']:.3f}`"
+            + (f"  ·  **Rating:** `{r['rating_float']:.1f}`" if pd.notna(r['rating_float']) else "")
+        )
+        story = r.get(STORY_COL)
+        if isinstance(story, str) and story.strip():
+            with st.expander("Storyline", expanded=True):
+                st.write(story)
+
+        url = r.get("URL")
+        if isinstance(url, str) and url.startswith("http"):
+            st.link_button("Open on IMDb", url)
+
+        if show_explain:
+            idx = r.name
+            terms = explain_overlap(q, X[idx], vec, topn=8)
+            if terms:
+                st.caption("Why it matched:")
+                st.write(" · ".join(f"`{t}`" for t in terms))
+        st.divider()
+
+    # download
+    csv_buf = io.StringIO()
+    res[[TITLE_COL, "similarity", "rating_float", STORY_COL, "URL"]].rename(
+        columns={"rating_float": "Rating"}
+    ).to_csv(csv_buf, index=False)
+    st.download_button("⬇️ Download results (CSV)", data=csv_buf.getvalue(),
+                       file_name=f"similar_to_{pick.replace(' ','_')}.csv", mime="text/csv")
+
+# ---------- Route ----------
+if mode == "Type a storyline":
+    run_text_mode()
+else:
+    run_item_mode()
+
+with st.expander("About this app"):
+    st.markdown(
+        "- TF-IDF on 2024 storylines (1–2 grams, English stopwords)\n"
+        "- Cosine similarity = dot product on normalized vectors\n"
+        "- Optional rating filter & similarity floor\n"
+        "- ‘Why it matched’ shows highest-weight overlapping terms\n"
+    )

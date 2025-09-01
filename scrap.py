@@ -1,328 +1,428 @@
 #!/usr/bin/env python3
-import csv, os, random, time
+import csv, random, time, calendar
 from pathlib import Path
 from dataclasses import dataclass, asdict
+from urllib.parse import urlencode
 
 import pandas as pd
-from bs4 import BeautifulSoup
-
-# --- use undetected chromedriver ---
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import (
+    TimeoutException, WebDriverException,
+    ElementClickInterceptedException, StaleElementReferenceException
+)
+from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------- Config ----------
-OUT_CSV = Path("imdb_2024_movies_storylines.csv")
-PROFILE_DIR = os.path.expanduser("~/imdb-scrape-profile")   # persistent cookie/consent
-UA_LIST = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+# ---------------- CONFIG ----------------
+YEAR = 2024
+TITLE_TYPE = "feature"      # IMDb: "Movie" == feature
+SORT = "moviemeter,asc"
+OUT_CSV = Path("imdb_2024_list_all.csv")
+
+PAGE_TIMEOUT = 15
+THROTTLE = (0.6, 1.2)
+CLICK_PAUSE = (0.4, 0.8)
+MAX_CLICKS_PER_SLICE = 10000  # essentially "until no button"
+
+BASE = "https://www.imdb.com/search/title/"
+
+# ---------- Selectors (new & old layouts) ----------
+SEL_NEW_ITEM   = "li.ipc-metadata-list-summary-item"
+SEL_NEW_LINK   = 'a.ipc-metadata-list-summary-item__t[href*="/title/tt"], a[href*="/title/tt"]'
+SEL_NEW_TITLE  = "h3.ipc-title__text"
+SEL_NEW_RATING = "span.ipc-rating-star--rating"
+SEL_NEW_VOTES  = "span.ipc-rating-star--voteCount"
+SEL_NEW_TIME   = "div.dli-title-metadata span"
+SEL_50_MORE    = [
+    "button.ipc-btn--load-more",
+    "button.ipc-see-more__button",
+    # “50 more” text variants (case-insensitive)
+    "//span[contains(translate(., 'MORE', 'more'),'50 more')]/ancestor::button[1]",
+    "//button[contains(., '50 more')]",
 ]
 
-BASE_URL = (
-    "https://www.imdb.com/search/title/"
-    "?title_type=feature"
-    "&release_date=2024-01-01,2024-12-31"
-    "&view=advanced"
-    "&sort=moviemeter,asc"
-    "&count=50"   # stay conservative to avoid rate limits
-)
+SEL_OLD_ITEM   = "div.lister-item.mode-advanced"
+SEL_OLD_LINK   = "h3.lister-item-header a"
+SEL_OLD_RATING = "div.ratings-bar strong, span.ipl-rating-star__rating"
+SEL_OLD_VOTES  = "p.sort-num_votes-visible span[name='nv']"
+SEL_OLD_TIME   = "p.text-muted span.runtime"
 
-THROTTLE_RESULTS = (6.0, 10.0)  # pause between result pages
-THROTTLE_TITLES  = (3.0, 6.0)   # pause between title pages
-
-# ---------- Model ----------
-@dataclass
-class MovieRow:
-    title: str
-    storyline: str
-    url: str
-    imdb_id: str
-
-# ---------- Driver ----------
-def make_driver(headless: bool = False):
-    """Non-headless + persistent profile helps bypass 403; uc handles stealth."""
-    w = random.randint(1200, 1600)
-    h = random.randint(800, 1100)
-    opts = uc.ChromeOptions()
+# ---------------- Driver -----------------
+def make_driver(headless=False):
+    opts = webdriver.ChromeOptions()
     if headless:
         opts.add_argument("--headless=new")
-    opts.add_argument(f"--user-data-dir={PROFILE_DIR}")  # keep cookies/consent
-    opts.add_argument(f"--window-size={w},{h}")
+    opts.add_argument("--window-size=1400,1000")
     opts.add_argument("--lang=en-US")
-    opts.add_argument(f"--user-agent={random.choice(UA_LIST)}")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    driver = uc.Chrome(options=opts)
-    # Best-effort mask
+    # soften automation signatures a bit
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
     try:
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
     except Exception:
         pass
     return driver
 
-# ---------- Helpers ----------
-def search_page_url(start: int) -> str:
-    return f"{BASE_URL}&start={start}"  # 1, 51, 101, ...
+def throttle():
+    time.sleep(random.uniform(*THROTTLE))
 
-def parse_imdb_id_from_url(url: str) -> str:
+def short_pause():
+    time.sleep(random.uniform(*CLICK_PAUSE))
+
+def accept_consent_if_present(driver):
+    try:
+        for sel in (
+            '[data-testid="consent-banner-accept"]',
+            '#onetrust-accept-btn-handler',
+            'button[aria-label*="Accept"]',
+            'button[aria-label*="accept"]',
+        ):
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els:
+                els[0].click()
+                time.sleep(0.3)
+                break
+    except Exception:
+        pass
+
+def wait_for_any_layout(driver):
+    WebDriverWait(driver, PAGE_TIMEOUT).until(
+        EC.any_of(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEL_NEW_ITEM)),
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEL_OLD_ITEM)),
+        )
+    )
+
+# --------------- Helpers ----------------
+def month_slices(year: int):
+    for m in range(1, 13):
+        last = calendar.monthrange(year, m)[1]
+        yield f"{year}-{m:02d}-01", f"{year}-{m:02d}-{last:02d}"
+
+def build_month_url(date_from: str, date_to: str, start: int) -> str:
+    # count=50 is important to expose the “50 more” button consistently
+    qs = {
+        "title_type": TITLE_TYPE,
+        "release_date": f"{date_from},{date_to}",
+        "view": "advanced",
+        "count": "50",
+        "sort": SORT,
+        "start": str(start),
+    }
+    return BASE + "?" + urlencode(qs)
+
+def normalize_title(raw: str) -> str:
+    raw = raw.strip()
+    if ". " in raw and raw.split(". ", 1)[0].isdigit():
+        return raw.split(". ", 1)[1]
+    return raw
+
+def parse_id_from_url(url: str) -> str:
     try:
         return url.split("/title/")[1].split("/")[0]
     except Exception:
         return ""
 
-def human_pause(lo, hi):
-    time.sleep(random.uniform(lo, hi))
+def get_all_cards(driver):
+    cards = driver.find_elements(By.CSS_SELECTOR, SEL_NEW_ITEM)
+    layout = "new"
+    if not cards:
+        cards = driver.find_elements(By.CSS_SELECTOR, SEL_OLD_ITEM)
+        layout = "old"
+    return cards, layout
 
-def accept_consent_if_present(driver):
-    try:
-        for sel in [
-            '[data-testid="consent-banner-accept"]',
-            '#onetrust-accept-btn-handler',
-            'button[aria-label*="Accept"]',
-        ]:
-            btns = driver.find_elements(By.CSS_SELECTOR, sel)
+def find_50_more(driver):
+    # CSS first
+    for css in SEL_50_MORE[:2]:
+        btns = driver.find_elements(By.CSS_SELECTOR, css)
+        if btns:
+            return ("css", css, btns[0])
+    # XPATH fallbacks
+    for xp in SEL_50_MORE[2:]:
+        try:
+            btns = driver.find_elements(By.XPATH, xp)
             if btns:
-                btns[0].click()
-                time.sleep(0.5)
-                break
+                return ("xpath", xp, btns[0])
+        except Exception:
+            pass
+    return None
+
+def pick_blurb_old(li) -> str:
+    try:
+        ps = li.find_elements(By.CSS_SELECTOR, ".lister-item-content p")
+        for p in ps:
+            txt = p.text.strip()
+            low = txt.lower()
+            if len(txt) > 20 and not any(k in low for k in ("director", "star", "metascore", "votes")):
+                return txt
     except Exception:
         pass
+    return ""
 
-def is_blocked_403(driver) -> bool:
+def pick_blurb_new(li) -> str:
     try:
-        title = (driver.title or "").lower()
-        if "403" in title or "forbidden" in title:
-            return True
-        body = driver.find_element(By.TAG_NAME, "body").text.lower()
-        return ("403" in body) and ("forbidden" in body)
+        t = li.find_element(By.CSS_SELECTOR, "div.ipc-html-content-inner-div").get_attribute("innerText").strip()
+        if len(t) > 20:
+            return t
     except Exception:
-        return False
+        pass
+    return ""
 
-def load_with_recovery(url: str, driver, max_restarts=2) -> uc.Chrome | None:
-    """Open URL; if 403, backoff and restart driver up to max_restarts."""
-    for attempt in range(1, max_restarts + 1):
-        driver.get(url)
-        accept_consent_if_present(driver)
-        human_pause(1.5, 3.0)
-        if not is_blocked_403(driver):
-            return driver
-        print(f"  ! 403 Forbidden on attempt {attempt}. Backing off...")
-        time.sleep(60 * attempt)   # backoff: 60s, 120s, ...
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        driver = make_driver(headless=False)
-    return None
+def parse_cards_into_rows(driver, seen_global: set, seen_slice: set) -> list[dict]:
+    rows = []
+    cards, layout = get_all_cards(driver)
 
-def extract_storyline_from_html(html: str) -> str | None:
-    soup = BeautifulSoup(html, "lxml")
-    # 1) JSON-LD
-    for script in soup.find_all("script", {"type": "application/ld+json"}):
+    for li in cards:
         try:
-            import json as _json
-            if not script.string:
-                continue
-            j = _json.loads(script.string)
-            def pick_desc(obj):
-                if isinstance(obj, dict):
-                    d = obj.get("description")
-                    if d and len(d.strip()) > 20:
-                        return d.strip()
-            if isinstance(j, list):
-                for obj in j:
-                    d = pick_desc(obj)
-                    if d: return d
+            if layout == "new":
+                a = li.find_element(By.CSS_SELECTOR, SEL_NEW_LINK)
+                url = a.get_attribute("href").split("?")[0]
+                try:
+                    title = normalize_title(li.find_element(By.CSS_SELECTOR, SEL_NEW_TITLE).text)
+                except Exception:
+                    title = a.text.strip()
+                # rating / votes / time
+                try:
+                    rating = li.find_element(By.CSS_SELECTOR, SEL_NEW_RATING).text.strip()
+                except Exception:
+                    rating = ""
+                try:
+                    votes = li.find_element(By.CSS_SELECTOR, SEL_NEW_VOTES).text.strip("()").replace(",", "")
+                except Exception:
+                    votes = ""
+                try:
+                    spans = li.find_elements(By.CSS_SELECTOR, SEL_NEW_TIME)
+                    duration = spans[1].get_attribute("innerText").strip() if len(spans) >= 2 else ""
+                except Exception:
+                    duration = ""
+                blurb = pick_blurb_new(li)
             else:
-                d = pick_desc(j)
-                if d: return d
-        except Exception:
-            pass
-    # 2) OpenGraph
-    og = soup.find("meta", {"property": "og:description"})
-    if og and og.get("content"):
-        d = og["content"].strip()
-        if d and len(d) > 20:
-            return d
-    # 3) Plot testids
-    plot = soup.select_one('[data-testid="plot-xl"], [data-testid="plot-l"], [data-testid="plot"]')
-    if plot:
-        txt = plot.get_text(strip=True)
-        if txt and len(txt) > 20:
-            return txt
-    # 4) Storyline heading
-    for h in soup.find_all(["h2","h3"]):
-        if "storyline" in h.get_text(" ", strip=True).lower():
-            nxt = h.find_next()
-            if nxt:
-                txt = nxt.get_text(" ", strip=True)
-                if txt and len(txt) > 20:
-                    return txt
-    return None
-
-def append_rows(rows: list[MovieRow]):
-    mode = "a" if OUT_CSV.exists() else "w"
-    with OUT_CSV.open(mode, newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["title","storyline","url","imdb_id"])
-        if mode == "w":
-            w.writeheader()
-        for r in rows:
-            w.writerow(asdict(r))
-
-# ---------- Core ----------
-def scrape_result_links(driver, start: int) -> list[str]:
-    url = search_page_url(start)
-    driver = load_with_recovery(url, driver)
-    if driver is None:
-        print("  ! Could not bypass 403 on results page.")
-        return []
-
-    # Wait for either layout
-    try:
-        WebDriverWait(driver, 15).until(
-            EC.any_of(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "h3.lister-item-header a")),
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'a[href*="/title/tt"].ipc-metadata-list-summary-item__t')),
-            )
-        )
-    except TimeoutException:
-        print("  ! Results not visible. Title:", driver.title)
-        return []
-
-    links = []
-    # Old lister
-    for a in driver.find_elements(By.CSS_SELECTOR, "h3.lister-item-header a"):
-        href = a.get_attribute("href")
-        if href and "/title/" in href:
-            links.append(href.split("?")[0])
-    # New ipc
-    for a in driver.find_elements(By.CSS_SELECTOR, 'a[href*="/title/tt"].ipc-metadata-list-summary-item__t'):
-        href = a.get_attribute("href")
-        if href and "/title/" in href:
-            links.append(href.split("?")[0])
-
-    # Dedup preserve order
-    seen, uniq = set(), []
-    for l in links:
-        if l not in seen:
-            uniq.append(l); seen.add(l)
-    return uniq
-
-def scrape_all_2024(headless=False):
-    driver = make_driver(headless=headless)  # start non-headless
-    try:
-        # Resume support
-        seen_ids = set()
-        if OUT_CSV.exists():
-            try:
-                df = pd.read_csv(OUT_CSV)
-                seen_ids = set(df.get("imdb_id", pd.Series(dtype=str)).dropna().astype(str).tolist())
-                print(f"↺ Resume: {len(seen_ids)} rows already in {OUT_CSV}")
-            except Exception:
-                pass
-
-        start = 1
-        total_new = 0
-
-        while True:
-            print(f"\n[Search] start={start}")
-            links = scrape_result_links(driver, start)
-            if not links:
-                print("No more results (or failed to load). Stopping.")
-                break
-
-            buffer: list[MovieRow] = []
-            for idx, url in enumerate(links, 1):
-                imdb_id = parse_imdb_id_from_url(url)
-                if imdb_id in seen_ids:
-                    print(f"  • [{idx:03d}] skip (seen) {imdb_id}")
-                    human_pause(*THROTTLE_TITLES)
-                    continue
-
-                # Load title page with recovery
-                d2 = load_with_recovery(url, driver)
-                if d2 is None:
-                    print(f"  x [{idx:03d}] 403 persists on title page, skipping.")
-                    human_pause(*THROTTLE_TITLES)
-                    continue
-                driver = d2  # keep the possibly restarted driver
-
+                a = li.find_element(By.CSS_SELECTOR, SEL_OLD_LINK)
+                url = a.get_attribute("href").split("?")[0]
+                title = normalize_title(a.text)
                 try:
-                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "title")))
-                except TimeoutException:
-                    print(f"  ! [{idx:03d}] title didn't load, skip.")
-                    human_pause(*THROTTLE_TITLES)
-                    continue
-
-                html = driver.page_source
-
-                # Title
-                title = ""
+                    rating = li.find_element(By.CSS_SELECTOR, SEL_OLD_RATING).text.strip()
+                except Exception:
+                    rating = ""
+                votes = ""
                 try:
-                    soup = BeautifulSoup(html, "lxml")
-                    jd = soup.find("script", {"type": "application/ld+json"})
-                    if jd and jd.string:
-                        import json as _json
-                        d = _json.loads(jd.string)
-                        if isinstance(d, dict):
-                            title = d.get("name") or ""
-                        elif isinstance(d, list):
-                            for obj in d:
-                                if isinstance(obj, dict) and obj.get("@type") in {"Movie","TVSeries"}:
-                                    title = obj.get("name") or ""
-                                    if title: break
-                    if not title:
-                        ttag = soup.find("title")
-                        if ttag:
-                            title = ttag.get_text(strip=True).replace("- IMDb","").strip()
+                    nv = li.find_elements(By.CSS_SELECTOR, SEL_OLD_VOTES)
+                    if nv:
+                        votes = (nv[0].get_attribute("data-value") or nv[0].text).replace(",", "")
                 except Exception:
                     pass
+                try:
+                    duration = li.find_element(By.CSS_SELECTOR, SEL_OLD_TIME).text.strip()
+                except Exception:
+                    duration = ""
+                blurb = pick_blurb_old(li)
+        except Exception:
+            continue
 
-                storyline = extract_storyline_from_html(html) or ""
-                if title and storyline:
-                    buffer.append(MovieRow(title=title, storyline=storyline, url=url, imdb_id=imdb_id))
-                    seen_ids.add(imdb_id)
-                    total_new += 1
-                    print(f"  ✓ [{idx:03d}] {title} ({imdb_id})")
-                else:
-                    print(f"  · [{idx:03d}] skipped (missing title/storyline): {imdb_id}")
+        imdb_id = parse_id_from_url(url)
+        if not imdb_id or imdb_id in seen_global or imdb_id in seen_slice:
+            continue
 
-                human_pause(*THROTTLE_TITLES)
+        rows.append({
+            "Movie Name": title,
+            "IMDb ID": imdb_id,
+            "URL": url,
+            "Rating": rating,
+            "Voting Counts": votes,
+            "Duration": duration,
+            "Storyline (list blurb)": blurb,
+        })
+    return rows
 
-                # Flush every 40 items
-                if len(buffer) >= 40:
-                    append_rows(buffer)
-                    print(f"    ↳ saved {len(buffer)} rows (total new={total_new})")
-                    buffer.clear()
+def append_rows(rows: list[dict]):
+    mode = "a" if OUT_CSV.exists() else "w"
+    with OUT_CSV.open(mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "Movie Name","IMDb ID","URL","Rating","Voting Counts","Duration","Storyline (list blurb)"
+        ])
+        if mode == "w":
+            w.writeheader()
+        w.writerows(rows)
 
-            if buffer:
-                append_rows(buffer)
-                print(f"    ↳ saved {len(buffer)} rows (page end; total new={total_new})")
+# ------------- Core per-slice -------------
+def scrape_month_with_load_more(driver, date_from: str, date_to: str, seen_global: set) -> int:
+    """Loads monthly page, then keeps clicking '50 more' until the button disappears.
+       Saves after each click so virtualization/crashes don’t lose progress.
+       If tab crashes, resumes from the correct start offset.
+    """
+    saved_in_slice = 0
+    seen_slice = set()
 
-            start += 50                   # next page (count=50)
-            human_pause(*THROTTLE_RESULTS)
+    # resume loop: if we crash, we reload with start = saved_in_slice + 1
+    while True:
+        start_offset = saved_in_slice + 1
+        url = build_month_url(date_from, date_to, start_offset)
 
-        # Final dedup
-        if OUT_CSV.exists():
+        # nav with crash-guard
+        try:
+            driver.get(url)
+        except WebDriverException:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            driver = make_driver(headless=False)
+            driver.get(url)
+
+        accept_consent_if_present(driver)
+        try:
+            wait_for_any_layout(driver)
+        except TimeoutException:
+            # month likely empty; bail
+            return saved_in_slice
+
+        # initial parse & save (the first 50 at this offset)
+        rows = parse_cards_into_rows(driver, seen_global, seen_slice)
+        if rows:
+            append_rows(rows)
+            for r in rows:
+                seen_global.add(r["IMDb ID"]); seen_slice.add(r["IMDb ID"])
+            saved_in_slice += len(rows)
+            print(f"📦 [{date_from}..{date_to}] Saved {len(rows)} rows (slice total: {saved_in_slice})")
+        else:
+            print(f"ℹ️ [{date_from}..{date_to}] No new rows at start={start_offset}")
+
+        clicks = 0
+        while clicks < MAX_CLICKS_PER_SLICE:
+            # find button
+            btn_triplet = find_50_more(driver)
+            if not btn_triplet:
+                print("✅ Button gone for this month — fully expanded at current offset.")
+                break
+
+            # scroll toward bottom to ensure virtualization shows the “end”
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 200);")
+            except Exception:
+                pass
+            short_pause()
+
+            # click with fallbacks
+            _, _, btn = btn_triplet
+            clicked = False
+            try:
+                btn.click()
+                clicked = True
+            except (ElementClickInterceptedException, StaleElementReferenceException):
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                except Exception:
+                    clicked = False
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                except Exception:
+                    clicked = False
+
+            if not clicked:
+                print("⚠️ Click failed; stopping this offset chunk.")
+                break
+
+            # let items load a moment
+            short_pause()
+
+            # parse & save *whatever is in DOM now* (handles virtualization)
+            before = saved_in_slice
+            rows = parse_cards_into_rows(driver, seen_global, seen_slice)
+            if rows:
+                append_rows(rows)
+                for r in rows:
+                    seen_global.add(r["IMDb ID"]); seen_slice.add(r["IMDb ID"])
+                saved_in_slice += len(rows)
+                print(f"➡️ Clicked '50 more' ({clicks+1}). Saved {len(rows)} new rows (slice total: {saved_in_slice})")
+            else:
+                print("ℹ️ Click registered but no new unique rows this pass (likely virtualization).")
+
+            clicks += 1
+            throttle()
+
+        # If button disappeared, the current offset is fully drained.
+        # We now try to continue from the *next* offset (saved_in_slice + 1).
+        # If that next page yields no new rows immediately, we’re done with the month.
+        # Otherwise the outer while True will repeat, adding more until exhausted.
+        # The outer loop breaks when first page after an offset saves 0 new rows.
+        # That means “no more results at all for this month”.
+        # Outer while will re-check; if empty at fresh offset, break:
+        rows_test_url = build_month_url(date_from, date_to, saved_in_slice + 1)
+        try:
+            driver.get(rows_test_url)
+            accept_consent_if_present(driver)
+            wait_for_any_layout(driver)
+            probe = parse_cards_into_rows(driver, seen_global, seen_slice)
+            if not probe:
+                break
+            else:
+                # We found more beyond this offset; loop will repeat with new offset.
+                continue
+        except Exception:
+            break
+
+    return saved_in_slice
+
+# ----------------- Runner -----------------
+def scrape_all_from_listing():
+    # resume from CSV across slices
+    seen_global = set()
+    if OUT_CSV.exists():
+        try:
             df = pd.read_csv(OUT_CSV)
-            before = len(df)
-            df = df.drop_duplicates(subset=["imdb_id"]).reset_index(drop=True)
-            df.to_csv(OUT_CSV, index=False)
-            print(f"\nDe-duplicated: {before} -> {len(df)} rows in {OUT_CSV}")
+            seen_global = set(df.get("IMDb ID", pd.Series(dtype=str)).dropna().astype(str))
+            print(f"↺ Resume: {len(seen_global)} rows already in {OUT_CSV}")
+        except Exception:
+            pass
 
-        print(f"\nDone. New rows collected: {total_new}")
+    total_saved = 0
+    driver = make_driver(headless=False)
+    try:
+        for date_from, date_to in month_slices(YEAR):
+            print(f"\n==> Slice {date_from} .. {date_to}")
+            try:
+                added = scrape_month_with_load_more(driver, date_from, date_to, seen_global)
+            except WebDriverException:
+                print("💥 Tab crashed. Recovering and resuming this slice…")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = make_driver(headless=False)
+                added = scrape_month_with_load_more(driver, date_from, date_to, seen_global)
 
+            print(f"   ↳ Finished slice {date_from}..{date_to} (+{added})")
+            total_saved += added
+            time.sleep(1.0)
     finally:
         try:
             driver.quit()
         except Exception:
             pass
 
+    # final dedupe
+    if OUT_CSV.exists():
+        df = pd.read_csv(OUT_CSV)
+        before = len(df)
+        df = df.drop_duplicates(subset=["IMDb ID"]).reset_index(drop=True)
+        df.to_csv(OUT_CSV, index=False)
+        print(f"\n🔁 De-duplicated: {before} -> {len(df)} rows in {OUT_CSV}")
+
+    print(f"Done. Collected {total_saved} NEW rows. CSV: {OUT_CSV}")
+
 if __name__ == "__main__":
-    scrape_all_2024(headless=False)  # start non-headless first time
+    scrape_all_from_listing()
